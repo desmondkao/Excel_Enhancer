@@ -5,11 +5,14 @@ import json
 import os
 import time
 import io
-import traceback  # Make sure traceback is imported at top level
+import traceback
 from dotenv import load_dotenv
 import requests
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import re
+import concurrent.futures
+from datetime import datetime
+import math
 
 # Load environment variables
 load_dotenv()
@@ -33,6 +36,10 @@ def setup_debug():
         
 st.debug = setup_debug()
 
+# Define a concurrent processing placeholder for storing results
+if 'concurrent_results' not in st.session_state:
+    st.session_state.concurrent_results = []
+
 # Function to extract JSON from Claude's response
 def extract_json_from_response(text: str) -> str:
     """Extract JSON from Claude's response."""
@@ -55,6 +62,40 @@ def is_company_email(email: str) -> bool:
     
     domain = email.split('@')[1].lower()
     return domain not in common_personal_domains
+
+# Function to automatically save files to a local directory
+def auto_save_data(df: pd.DataFrame, prefix: str = "auto_save", directory: str = "./data_exports"):
+    """
+    Automatically save dataframe to a local directory with timestamp.
+    
+    Args:
+        df: Dataframe to save
+        prefix: Prefix for the filename
+        directory: Directory to save files in
+    
+    Returns:
+        Path to the saved file
+    """
+    # Create directory if it doesn't exist
+    os.makedirs(directory, exist_ok=True)
+    
+    # Generate timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Create filename with timestamp
+    filename = f"{prefix}_{timestamp}.xlsx"
+    filepath = os.path.join(directory, filename)
+    
+    # Save file
+    try:
+        # Create Excel file
+        with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Augmented Data')
+        
+        return filepath
+    except Exception as e:
+        st.error(f"Error auto-saving file: {str(e)}")
+        return None
 
 # Function to get known financial domains
 def get_financial_domain_info() -> Dict[str, Dict[str, str]]:
@@ -176,7 +217,6 @@ def generate_search_query(row_data: Dict[str, Any], target_column: str, search_c
     query = f"{entity_name} {target_column} {search_context}".strip()
     return query
 
-# Function to extract data using Claude
 def extract_data_with_claude(row_data: Dict[str, Any], context: str, target_column: str, claude_api_key: str, using_tavily: bool = True) -> Any:
     """Extract specific data from context using Claude."""
     
@@ -235,38 +275,58 @@ def extract_data_with_claude(row_data: Dict[str, Any], context: str, target_colu
         """
     
     try:
-        # Send to Claude API
-        client = anthropic.Anthropic(api_key=claude_api_key)
-        response = client.messages.create(
-            model="claude-3-haiku-20240307",
-            max_tokens=1000,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_content}]
-        )
+        # Create Anthropic client with only the API key parameter
+        try:
+            # Import inside function to ensure fresh import
+            from anthropic import Anthropic
+            client = Anthropic(api_key=claude_api_key)
+        except Exception as client_error:
+            st.debug(f"Error creating Claude client: {str(client_error)}")
+            return None
+        
+        try:
+            response = client.messages.create(
+                model="claude-3-haiku-20240307",
+                max_tokens=1000,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_content}]
+            )
+        except Exception as request_error:
+            st.debug(f"Error during Claude API request: {str(request_error)}")
+            return None
         
         # Extract response
-        json_str = extract_json_from_response(response.content[0].text)
-        result = json.loads(json_str)
-        return result.get(target_column)
+        try:
+            json_str = extract_json_from_response(response.content[0].text)
+            result = json.loads(json_str)
+            return result.get(target_column)
+        except Exception as parse_error:
+            st.debug(f"Error parsing Claude response: {str(parse_error)}")
+            return None
+            
     except Exception as e:
-        st.error(f"Error extracting data with Claude: {str(e)}")
+        st.debug(f"Error extracting data with Claude: {str(e)}")
         return None
 
-# Process a single row
-def process_row(
-    row_data: Dict[str, Any], 
-    idx: int, 
-    df: pd.DataFrame, 
-    target_columns: List[str],
-    search_contexts: Dict[str, str],
-    claude_api_key: str, 
-    tavily_api_key: str,
-    use_tavily: bool,
-    use_claude_direct: bool,
-    overwrite_existing: bool,
-    skip_non_company_emails: bool = True
-) -> pd.DataFrame:
-    """Process a single row and update the dataframe with augmented data."""
+# Process a single row (for concurrent processing)
+def process_row_concurrent(
+    args: Tuple
+) -> Tuple[int, Dict[str, Any]]:
+    """Process a single row concurrently and return results."""
+    (
+        row_data, 
+        idx, 
+        target_columns,
+        search_contexts,
+        claude_api_key, 
+        tavily_api_key,
+        use_tavily,
+        use_claude_direct,
+        overwrite_existing,
+        skip_non_company_emails
+    ) = args
+    
+    results = {}
     
     # Look for email field
     email_field = None
@@ -285,13 +345,11 @@ def process_row(
     if skip_non_company_emails and email_field and email_value:
         # Skip if no email or it's not a company email
         if '@' not in email_value:
-            st.debug(f"Row {idx+1}: Skipping due to missing @ in email")
-            return df
+            return idx, {}
             
         # Check if this appears to be a personal email
         if not is_company_email(email_value):
-            st.debug(f"Row {idx+1}: Skipping due to personal email domain")
-            return df
+            return idx, {}
     
     # Extract domain from email for context if available
     email_domain = None
@@ -319,18 +377,17 @@ def process_row(
     
     for target_column in target_columns:
         # Skip if value already exists and overwrite is not enabled
-        if not overwrite_existing and pd.notna(df.at[idx, target_column]) and str(df.at[idx, target_column]).strip():
+        current_value = row_data.get(target_column)
+        if not overwrite_existing and pd.notna(current_value) and str(current_value).strip():
             continue
             
         # Check if we already have the value from our known domains
         if known_company_info and target_column.lower() in ["country", "city"]:
             if target_column.lower() == "country" and "country" in known_company_info:
-                df.at[idx, target_column] = known_company_info["country"]
-                st.debug(f"Row {idx+1}: Used known domain info to set {target_column} to {known_company_info['country']}")
+                results[target_column] = known_company_info["country"]
                 continue
             elif target_column.lower() == "city" and "city" in known_company_info:
-                df.at[idx, target_column] = known_company_info["city"]
-                st.debug(f"Row {idx+1}: Used known domain info to set {target_column} to {known_company_info['city']}")
+                results[target_column] = known_company_info["city"]
                 continue
             
         # Generate search query with additional context
@@ -358,9 +415,7 @@ def process_row(
             search_result = search_with_tavily(search_query, tavily_api_key)
             
             # Check for errors in Tavily response
-            if "error" in search_result:
-                st.warning(f"Row {idx+1}: Tavily search failed for {target_column}. Using fallback method.")
-            else:
+            if "error" not in search_result:
                 tavily_context = search_result.get('answer', '')
         
         # If we have search results or using Claude direct is enabled
@@ -385,12 +440,11 @@ def process_row(
                 use_tavily  # Pass whether we're using Tavily to adjust Claude's approach
             )
             
-            # Update dataframe with extracted data
+            # Store extracted data
             if extracted_value:
-                df.at[idx, target_column] = extracted_value
-                st.debug(f"Row {idx+1}: Set {target_column} to {extracted_value}")
+                results[target_column] = extracted_value
     
-    return df
+    return idx, results
 
 # Function to process a batch of rows
 def process_batch(
@@ -405,36 +459,134 @@ def process_batch(
     use_claude_direct: bool,
     overwrite_existing: bool,
     skip_non_company_emails: bool = True,
-    progress_bar: Any = None
+    progress_bar: Any = None,
+    auto_save: bool = False,
+    auto_save_interval: int = 50,  # Save every 50 rows by default
+    input_filename: str = "data",
+    auto_save_directory: str = "./data_exports",
+    use_concurrent: bool = True,
+    max_workers: int = 4
 ) -> pd.DataFrame:
     """Process a batch of rows to augment with AI-generated data."""
     
-    for idx in range(start_idx, min(end_idx, len(df))):
-        # Convert row to dict
-        row_data = df.iloc[idx].to_dict()
+    # Calculate the actual range of indices to process
+    actual_end_idx = min(end_idx, len(df))
+    total_rows = actual_end_idx - start_idx
+    
+    if use_concurrent and total_rows > 1:
+        # Create args for concurrent processing
+        process_args = []
+        for idx in range(start_idx, actual_end_idx):
+            row_data = df.iloc[idx].to_dict()
+            args = (
+                row_data, 
+                idx, 
+                target_columns,
+                search_contexts,
+                claude_api_key, 
+                tavily_api_key,
+                use_tavily,
+                use_claude_direct,
+                overwrite_existing,
+                skip_non_company_emails
+            )
+            process_args.append(args)
         
-        # Process the row
-        df = process_row(
-            row_data, 
-            idx, 
-            df, 
-            target_columns, 
-            search_contexts, 
-            claude_api_key, 
-            tavily_api_key,
-            use_tavily,
-            use_claude_direct,
-            overwrite_existing,
-            skip_non_company_emails
-        )
+        # Calculate appropriate number of workers
+        # Not too many to avoid API rate limits, but enough for parallelism
+        actual_workers = min(max_workers, total_rows)
         
-        # Update progress bar if provided
-        if progress_bar:
-            progress_bar.progress((idx - start_idx + 1) / (end_idx - start_idx))
+        # Counter for auto-saving
+        rows_processed = 0
+        last_save_idx = 0
         
-        # Add small delay to avoid rate limiting
-        time.sleep(0.1)
+        # Process in chunks to avoid memory issues with very large files
+        chunk_size = min(100, total_rows)  # Process in chunks of 100 rows
+        for chunk_start in range(0, total_rows, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, total_rows)
+            chunk_args = process_args[chunk_start:chunk_end]
+            
+            # Process chunk concurrently
+            with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
+                # Submit all tasks
+                future_to_idx = {executor.submit(process_row_concurrent, args): i for i, args in enumerate(chunk_args)}
+                
+                # Process as they complete
+                for future in concurrent.futures.as_completed(future_to_idx):
+                    idx, results = future.result()
+                    
+                    # Update the dataframe with results
+                    for col, value in results.items():
+                        df.at[idx, col] = value
+                    
+                    # Update counter
+                    rows_processed += 1
+                    
+                    # Update progress bar
+                    if progress_bar:
+                        progress_bar.progress(rows_processed / total_rows)
+                    
+                    # Auto-save based on interval
+                    if auto_save and (rows_processed % auto_save_interval == 0):
+                        auto_save_path = auto_save_data(df, prefix=f"{input_filename}_partial", directory=auto_save_directory)
+                        if auto_save_path:
+                            # Use st.debug instead of st.info to avoid cluttering the UI
+                            st.debug(f"Auto-saved progress to {auto_save_path}")
+                            last_save_idx = rows_processed
+            
+            # Auto-save after each chunk
+            if auto_save and last_save_idx < rows_processed:
+                auto_save_path = auto_save_data(df, prefix=f"{input_filename}_chunk_{chunk_end}", directory=auto_save_directory)
+                if auto_save_path:
+                    st.debug(f"Auto-saved chunk to {auto_save_path}")
+                    last_save_idx = rows_processed
+    else:
+        # Sequential processing for small batches or when concurrent is disabled
+        rows_processed = 0
+        last_save_idx = 0
         
+        for idx in range(start_idx, actual_end_idx):
+            # Convert row to dict
+            row_data = df.iloc[idx].to_dict()
+            
+            # Process the row using a simplified version of process_row_concurrent
+            _, results = process_row_concurrent((
+                row_data, 
+                idx, 
+                target_columns,
+                search_contexts,
+                claude_api_key, 
+                tavily_api_key,
+                use_tavily,
+                use_claude_direct,
+                overwrite_existing,
+                skip_non_company_emails
+            ))
+            
+            # Update the dataframe with results
+            for col, value in results.items():
+                df.at[idx, col] = value
+            
+            # Update counter
+            rows_processed += 1
+            
+            # Update progress bar
+            if progress_bar:
+                progress_bar.progress(rows_processed / total_rows)
+            
+            # Auto-save based on interval
+            if auto_save and (rows_processed % auto_save_interval == 0):
+                auto_save_path = auto_save_data(df, prefix=f"{input_filename}_partial", directory=auto_save_directory)
+                if auto_save_path:
+                    st.debug(f"Auto-saved progress to {auto_save_path}")
+                    last_save_idx = rows_processed
+    
+    # Final auto-save at the end if not recently saved
+    if auto_save and last_save_idx < rows_processed:
+        auto_save_path = auto_save_data(df, prefix=f"{input_filename}_complete", directory=auto_save_directory)
+        if auto_save_path:
+            st.success(f"Auto-saved final results to {auto_save_path}")
+    
     return df
 
 def get_default_context(column_name: str) -> str:
@@ -526,6 +678,24 @@ def main():
                                    help="Disable if you're experiencing Tavily API errors")
     use_claude_direct = st.sidebar.checkbox("Use Claude's direct extraction", value=True,
                                           help="Claude will try to determine values even without web search")
+    
+    # Add auto-save options to UI
+    st.sidebar.header("Auto-Save Options")
+    enable_auto_save = st.sidebar.checkbox("Enable Auto-Saving", value=True, 
+                                        help="Automatically save progress to prevent data loss")
+    auto_save_interval = st.sidebar.number_input("Auto-Save Interval (rows)", 
+                                              min_value=10, max_value=1000, value=50,
+                                              help="Number of rows to process before auto-saving")
+    auto_save_directory = st.sidebar.text_input("Auto-Save Directory", 
+                                             value="./data_exports",
+                                             help="Directory to save files in")
+    
+    # Add concurrent processing options
+    st.sidebar.header("Performance Options")
+    use_concurrent = st.sidebar.checkbox("Enable Concurrent Processing", value=True,
+                                      help="Process multiple rows at once for faster results")
+    max_workers = st.sidebar.slider("Max Concurrent Workers", min_value=2, max_value=16, value=4,
+                                 help="Number of concurrent workers (higher = faster but may hit API limits)")
     
     # File uploader
     uploaded_file = st.file_uploader("Upload Excel file", type=["xlsx", "xls", "csv"])
@@ -622,6 +792,9 @@ def main():
                         # Store original data for comparison
                         original_df = df.copy()
                         
+                        # Extract filename without extension for better auto-save names
+                        input_filename = os.path.splitext(uploaded_file.name)[0] if uploaded_file else "data"
+                        
                         # Determine batch size
                         batch_size = test_batch_size if test_mode else len(df)
                         
@@ -629,7 +802,21 @@ def main():
                         st.subheader("Processing Data")
                         progress_bar = st.progress(0)
                         
+                        # Show auto-save status if enabled
+                        if enable_auto_save:
+                            st.info(f"Auto-saving enabled. Files will be saved to {auto_save_directory} every {auto_save_interval} rows.")
+                            # Create directory if it doesn't exist
+                            os.makedirs(auto_save_directory, exist_ok=True)
+                        
+                        # Show concurrency status
+                        if use_concurrent:
+                            st.info(f"Concurrent processing enabled with {max_workers} workers.")
+                        
                         with st.spinner(f"Processing {'test batch' if test_mode else 'entire dataset'}..."):
+                            # Record the start time
+                            start_time = time.time()
+                            
+                            # Process the data
                             processed_df = process_batch(
                                 df=df.copy(), 
                                 start_idx=0, 
@@ -642,8 +829,21 @@ def main():
                                 use_claude_direct=use_claude_direct,
                                 overwrite_existing=overwrite_existing,
                                 skip_non_company_emails=skip_non_company_emails,
-                                progress_bar=progress_bar
+                                progress_bar=progress_bar,
+                                auto_save=enable_auto_save,
+                                auto_save_interval=auto_save_interval,
+                                input_filename=input_filename,
+                                auto_save_directory=auto_save_directory,
+                                use_concurrent=use_concurrent,
+                                max_workers=max_workers
                             )
+                            
+                            # Record the end time and calculate duration
+                            end_time = time.time()
+                            duration = end_time - start_time
+                            
+                            # Display the processing time
+                            st.success(f"Processing completed in {duration:.2f} seconds!")
                         
                         # Show results
                         st.subheader("Results")
@@ -674,7 +874,14 @@ def main():
                                 st.subheader("Processing Complete File")
                                 full_progress_bar = st.progress(0)
                                 
+                                # Show auto-save status if enabled
+                                if enable_auto_save:
+                                    st.info(f"Auto-saving enabled. Files will be saved to {auto_save_directory} every {auto_save_interval} rows.")
+                                
                                 with st.spinner("Processing remaining data..."):
+                                    # Record the start time
+                                    start_time = time.time()
+                                    
                                     # Process remaining rows
                                     if batch_size < len(df):
                                         processed_df = process_batch(
@@ -689,18 +896,55 @@ def main():
                                             use_claude_direct=use_claude_direct,
                                             overwrite_existing=overwrite_existing,
                                             skip_non_company_emails=skip_non_company_emails,
-                                            progress_bar=full_progress_bar
+                                            progress_bar=full_progress_bar,
+                                            auto_save=enable_auto_save,
+                                            auto_save_interval=auto_save_interval,
+                                            input_filename=input_filename,
+                                            auto_save_directory=auto_save_directory,
+                                            use_concurrent=use_concurrent,
+                                            max_workers=max_workers
                                         )
+                                    
+                                    # Record end time and calculate duration
+                                    end_time = time.time()
+                                    duration = end_time - start_time
+                                    
+                                    # Display processing time
+                                    st.success(f"Full processing completed in {duration:.2f} seconds!")
                                     
                                 # Show full processed results
                                 st.success("Full file processed!")
                                 st.dataframe(processed_df)
+                                
+                                # If auto-save is enabled, show the auto-save directory
+                                if enable_auto_save:
+                                    st.success(f"Final results auto-saved to {auto_save_directory}")
+                                    # List the last few saved files
+                                    if os.path.exists(auto_save_directory):
+                                        files = [f for f in os.listdir(auto_save_directory) if f.startswith(input_filename)]
+                                        files.sort(reverse=True)  # Most recent first
+                                        if files:
+                                            st.info(f"Most recent auto-saved files:")
+                                            for i, file in enumerate(files[:5]):  # Show last 5 files
+                                                st.code(os.path.join(auto_save_directory, file))
                                 
                                 # Download options
                                 offer_download_options(processed_df)
                         else:
                             # If not in test mode, just show processed file and download option
                             st.dataframe(processed_df)
+                            
+                            # If auto-save is enabled, show the auto-save directory
+                            if enable_auto_save:
+                                st.success(f"Results auto-saved to {auto_save_directory}")
+                                # List the last few saved files
+                                if os.path.exists(auto_save_directory):
+                                    files = [f for f in os.listdir(auto_save_directory) if f.startswith(input_filename)]
+                                    files.sort(reverse=True)  # Most recent first
+                                    if files:
+                                        st.info(f"Most recent auto-saved files:")
+                                        for i, file in enumerate(files[:5]):  # Show last 5 files
+                                            st.code(os.path.join(auto_save_directory, file))
                             
                             # Download options
                             offer_download_options(processed_df)
