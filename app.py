@@ -6,16 +6,12 @@ import os
 import time
 import io
 import traceback
-from dotenv import load_dotenv
 import requests
 from typing import Dict, Any, List, Optional, Tuple
 import re
 import concurrent.futures
 from datetime import datetime
 import math
-
-# Load environment variables
-load_dotenv()
 
 # Set page config
 st.set_page_config(
@@ -867,7 +863,6 @@ def offer_download_options(df: pd.DataFrame):
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-# Main app function
 def main():
     st.title("AI-Powered Excel Data Augmentation Tool")
     st.markdown("### Enhanced with Geographic Validation")
@@ -875,23 +870,28 @@ def main():
     # Sidebar for API keys
     st.sidebar.header("API Configuration")
     
-    # Get API keys from environment or user input
-    claude_api_key = os.environ.get("CLAUDE_API_KEY", "")
-    tavily_api_key = os.environ.get("TAVILY_API_KEY", "")
-    
-    if not claude_api_key:
-        claude_api_key = st.sidebar.text_input("Claude API Key", type="password")
-    else:
-        st.sidebar.success("Claude API Key loaded from .env file ✅")
-        
-    if not tavily_api_key:
-        tavily_api_key = st.sidebar.text_input("Tavily API Key", type="password")
-    else:
-        st.sidebar.success("Tavily API Key loaded from .env file ✅")
+    # Try to get API keys from Streamlit secrets first, then fall back to user input
+    try:
+        claude_api_key = st.secrets["CLAUDE_API_KEY"]
+        st.sidebar.success("✅ Claude API Key loaded from secrets")
+    except:
+        claude_api_key = st.sidebar.text_input("Claude API Key", type="password", 
+                                            help="Enter your Anthropic Claude API key")
+        if not claude_api_key:
+            st.sidebar.warning("⚠️ Claude API Key required")
+
+    try:
+        tavily_api_key = st.secrets["TAVILY_API_KEY"]
+        st.sidebar.success("✅ Tavily API Key loaded from secrets")
+    except:
+        tavily_api_key = st.sidebar.text_input("Tavily API Key", type="password",
+                                            help="Enter your Tavily search API key")
+        if not tavily_api_key:
+            st.sidebar.warning("⚠️ Tavily API Key required")
     
     # Add debug mode toggle
     st.session_state.debug_mode = st.sidebar.checkbox("Enable Debug Mode", value=False)
-    st.debug = setup_debug()  # Update debug function based on checkbox
+    st.debug = setup_debug()
     
     # Sidebar for API options
     st.sidebar.header("API Options")
