@@ -97,28 +97,128 @@ def auto_save_data(df: pd.DataFrame, prefix: str = "auto_save", directory: str =
         st.error(f"Error auto-saving file: {str(e)}")
         return None
 
-# Function to get known financial domains
+# Function to get known financial domains with state information
 def get_financial_domain_info() -> Dict[str, Dict[str, str]]:
     """Return a dictionary of known financial domains with company and location info."""
     return {
-        "bmo.com": {"company": "Bank of Montreal", "country": "Canada", "city": "Montreal"},
-        "usbank.com": {"company": "US Bank", "country": "United States", "city": "Minneapolis"},
-        "fmr.com": {"company": "Fidelity Investments", "country": "United States", "city": "Boston"},
-        "nepc.com": {"company": "New England Pension Consultants", "country": "United States", "city": "Boston"},
-        "jpmorgan.com": {"company": "JPMorgan Chase", "country": "United States", "city": "New York"},
-        "gs.com": {"company": "Goldman Sachs", "country": "United States", "city": "New York"},
-        "ms.com": {"company": "Morgan Stanley", "country": "United States", "city": "New York"},
-        "bofa.com": {"company": "Bank of America", "country": "United States", "city": "Charlotte"},
-        "citi.com": {"company": "Citigroup", "country": "United States", "city": "New York"},
-        "blackrock.com": {"company": "BlackRock", "country": "United States", "city": "New York"},
-        "vanguard.com": {"company": "Vanguard Group", "country": "United States", "city": "Valley Forge"},
-        "statestreet.com": {"company": "State Street", "country": "United States", "city": "Boston"},
-        "wellsfargo.com": {"company": "Wells Fargo", "country": "United States", "city": "San Francisco"},
-        "pnc.com": {"company": "PNC Financial Services", "country": "United States", "city": "Pittsburgh"},
-        "schwab.com": {"company": "Charles Schwab", "country": "United States", "city": "San Francisco"},
-        "tdbank.com": {"company": "TD Bank", "country": "United States", "city": "Cherry Hill"},
-        "rbccm.com": {"company": "RBC Capital Markets", "country": "Canada", "city": "Toronto"}
+        "bmo.com": {"company": "Bank of Montreal", "country": "Canada", "city": "Montreal", "state": "Quebec"},
+        "usbank.com": {"company": "US Bank", "country": "United States", "city": "Minneapolis", "state": "Minnesota"},
+        "fmr.com": {"company": "Fidelity Investments", "country": "United States", "city": "Boston", "state": "Massachusetts"},
+        "nepc.com": {"company": "New England Pension Consultants", "country": "United States", "city": "Boston", "state": "Massachusetts"},
+        "jpmorgan.com": {"company": "JPMorgan Chase", "country": "United States", "city": "New York", "state": "New York"},
+        "gs.com": {"company": "Goldman Sachs", "country": "United States", "city": "New York", "state": "New York"},
+        "ms.com": {"company": "Morgan Stanley", "country": "United States", "city": "New York", "state": "New York"},
+        "bofa.com": {"company": "Bank of America", "country": "United States", "city": "Charlotte", "state": "North Carolina"},
+        "citi.com": {"company": "Citigroup", "country": "United States", "city": "New York", "state": "New York"},
+        "blackrock.com": {"company": "BlackRock", "country": "United States", "city": "New York", "state": "New York"},
+        "vanguard.com": {"company": "Vanguard Group", "country": "United States", "city": "Valley Forge", "state": "Pennsylvania"},
+        "statestreet.com": {"company": "State Street", "country": "United States", "city": "Boston", "state": "Massachusetts"},
+        "wellsfargo.com": {"company": "Wells Fargo", "country": "United States", "city": "San Francisco", "state": "California"},
+        "pnc.com": {"company": "PNC Financial Services", "country": "United States", "city": "Pittsburgh", "state": "Pennsylvania"},
+        "schwab.com": {"company": "Charles Schwab", "country": "United States", "city": "San Francisco", "state": "California"},
+        "tdbank.com": {"company": "TD Bank", "country": "United States", "city": "Cherry Hill", "state": "New Jersey"},
+        "rbccm.com": {"company": "RBC Capital Markets", "country": "Canada", "city": "Toronto", "state": "Ontario"}
     }
+
+# Geographic validation mappings
+def get_geographic_mappings() -> Dict[str, Dict[str, str]]:
+    """Return known city-state-country mappings for validation."""
+    return {
+        'Boston': {'state': 'Massachusetts', 'country': 'United States'},
+        'Montreal': {'state': 'Quebec', 'country': 'Canada'},
+        'Minneapolis': {'state': 'Minnesota', 'country': 'United States'},
+        'Toronto': {'state': 'Ontario', 'country': 'Canada'},
+        'New York': {'state': 'New York', 'country': 'United States'},
+        'Chicago': {'state': 'Illinois', 'country': 'United States'},
+        'Los Angeles': {'state': 'California', 'country': 'United States'},
+        'San Francisco': {'state': 'California', 'country': 'United States'},
+        'Charlotte': {'state': 'North Carolina', 'country': 'United States'},
+        'Pittsburgh': {'state': 'Pennsylvania', 'country': 'United States'},
+        'Cherry Hill': {'state': 'New Jersey', 'country': 'United States'},
+        'Valley Forge': {'state': 'Pennsylvania', 'country': 'United States'},
+        'Washington': {'state': 'District of Columbia', 'country': 'United States'},
+        'Atlanta': {'state': 'Georgia', 'country': 'United States'},
+        'Miami': {'state': 'Florida', 'country': 'United States'},
+        'Dallas': {'state': 'Texas', 'country': 'United States'},
+        'Houston': {'state': 'Texas', 'country': 'United States'},
+        'Phoenix': {'state': 'Arizona', 'country': 'United States'},
+        'Denver': {'state': 'Colorado', 'country': 'United States'},
+        'Seattle': {'state': 'Washington', 'country': 'United States'},
+        'Vancouver': {'state': 'British Columbia', 'country': 'Canada'},
+        'Calgary': {'state': 'Alberta', 'country': 'Canada'},
+        'Ottawa': {'state': 'Ontario', 'country': 'Canada'}
+    }
+
+# Function to validate geographic consistency
+def validate_geographic_consistency(results: Dict[str, Any], row_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate and correct geographic inconsistencies."""
+    # Get all location data (existing + newly filled)
+    all_data = {**row_data, **results}
+    
+    city = state = country = None
+    city_col = state_col = country_col = None
+    
+    # Extract location information and track column names
+    for col, value in all_data.items():
+        if 'city' in col.lower() and value and str(value).strip() and str(value).strip() != 'None':
+            city = str(value).strip()
+            city_col = col
+        elif 'state' in col.lower() and value and str(value).strip() and str(value).strip() != 'None':
+            state = str(value).strip()
+            state_col = col
+        elif 'country' in col.lower() and value and str(value).strip() and str(value).strip() != 'None':
+            country = str(value).strip()
+            country_col = col
+    
+    # Get known mappings
+    known_mappings = get_geographic_mappings()
+    
+    # Validate and correct if needed
+    if city and city in known_mappings:
+        expected = known_mappings[city]
+        
+        # Correct state if it's wrong and we have a state column in results
+        if state and state != expected['state'] and state_col and state_col in results:
+            st.debug(f"Correcting state from {state} to {expected['state']} for city {city}")
+            results[state_col] = expected['state']
+            
+        # Correct country if it's wrong and we have a country column in results
+        if country and country != expected['country'] and country_col and country_col in results:
+            st.debug(f"Correcting country from {country} to {expected['country']} for city {city}")
+            results[country_col] = expected['country']
+            
+        # Fill in missing state if we have a state column in results but no value
+        if not state and state_col and state_col in results:
+            st.debug(f"Adding missing state {expected['state']} for city {city}")
+            results[state_col] = expected['state']
+            
+        # Fill in missing country if we have a country column in results but no value
+        if not country and country_col and country_col in results:
+            st.debug(f"Adding missing country {expected['country']} for city {city}")
+            results[country_col] = expected['country']
+    
+    return results
+
+# Function to get processing order for geographic consistency
+def get_processing_order(target_columns: List[str]) -> List[str]:
+    """Return columns in logical processing order for geographic consistency."""
+    # Process geographic fields in logical order: country -> state -> city
+    priority_order = ['country', 'state', 'province', 'region', 'city']
+    ordered_columns = []
+    remaining_columns = []
+    
+    # First, add geographic columns in order
+    for priority in priority_order:
+        for col in target_columns:
+            if priority in col.lower() and col not in ordered_columns:
+                ordered_columns.append(col)
+    
+    # Then add remaining columns
+    for col in target_columns:
+        if col not in ordered_columns:
+            remaining_columns.append(col)
+    
+    return ordered_columns + remaining_columns
 
 # Function to search with Tavily
 def search_with_tavily(query: str, api_key: str) -> Dict[str, Any]:
@@ -217,62 +317,162 @@ def generate_search_query(row_data: Dict[str, Any], target_column: str, search_c
     query = f"{entity_name} {target_column} {search_context}".strip()
     return query
 
-def extract_data_with_claude(row_data: Dict[str, Any], context: str, target_column: str, claude_api_key: str, using_tavily: bool = True) -> Any:
-    """Extract specific data from context using Claude."""
+def get_improved_system_prompt(target_column: str, using_tavily: bool = True) -> str:
+    """Generate improved system prompts with geographic validation."""
     
-    # Adjust the system prompt based on whether we're using Tavily search results or direct extraction
+    # Base format
+    base_format = f'''
+Return a JSON with a single key "{target_column}" containing the extracted value. If the information is not available, return null.
+
+Return format:
+{{
+    "{target_column}": "Extracted Value or null"
+}}
+'''
+    
     if using_tavily:
-        system_prompt = f"""
-        Extract the {target_column} for the entity from the provided search results.
-        Return a JSON with a single key "{target_column}" containing the extracted value. If the information is not available, return null.
-        
-        Return format:
-        {{
-            "{target_column}": "Extracted Value or null"
-        }}
-        
-        Focus on extracting accurate, specific information. Be precise and avoid speculation.
-        If multiple values are mentioned, choose the most authoritative or recent one.
-        """
-        
-        user_content = f"""
-        Entity Information: {json.dumps(row_data)}
-        
-        Search Results: {context}
-        
-        Extract the {target_column} value for this entity.
-        """
+        # For Tavily search results
+        if 'country' in target_column.lower():
+            return f'''
+Extract the {target_column} for the entity from the provided search results.
+
+GEOGRAPHIC VALIDATION RULES:
+- If you see a city mentioned in the entity data, ensure the country matches that city's location
+- For example: Montreal = Canada, Boston = United States, London = United Kingdom
+- Cross-reference city and state information to validate country accuracy
+- Prioritize official headquarters information over branch locations
+
+{base_format}
+
+Focus on extracting accurate, specific information. Be precise and avoid speculation.
+If multiple locations are mentioned, choose the headquarters or primary location.
+'''
+            
+        elif 'state' in target_column.lower():
+            return f'''
+Extract the {target_column} (state/province/region) for the entity from the provided search results.
+
+GEOGRAPHIC VALIDATION RULES:
+- If you see a city in the entity data, the state MUST match that city's actual location
+- Examples: Boston = Massachusetts, Montreal = Quebec, Minneapolis = Minnesota
+- Do not guess or use random states - only return a state if you're certain it matches the city
+- For international locations, use appropriate regional divisions (provinces, states, etc.)
+
+{base_format}
+
+CRITICAL: If the city doesn't match common knowledge of state locations, return null rather than guessing.
+'''
+            
+        else:
+            return f'''
+Extract the {target_column} for the entity from the provided search results.
+{base_format}
+Focus on extracting accurate, specific information. Be precise and avoid speculation.
+'''
+    
     else:
-        # More direct extraction approach when not using Tavily
-        system_prompt = f"""
-        Based on the entity information provided, determine the most likely value for {target_column}.
-        Use your knowledge and the provided entity data to make an educated determination.
-        
-        Return a JSON with a single key "{target_column}" containing your determination. If you cannot determine a value, return null.
-        
-        Return format:
-        {{
-            "{target_column}": "Determined Value or null"
-        }}
-        
-        Consider typical patterns in the data. For example:
-        - If determining a country based on an email domain like @bmo.com, recognize that BMO (Bank of Montreal) is headquartered in Canada
-        - If determining a country based on city, use the city to find the country (e.g., Montreal is in Canada, Boston is in USA)
-        - Email domains can often indicate company location - for example:
-          * usbank.com → United States
-          * bmo.com → Canada
-          * nepc.com → United States (New England Pension Consultants)
-          * fmr.com → United States (Fidelity Management & Research)
-        
-        IMPORTANT: Skip determination on individuals with personal email domains such as gmail.com, yahoo.com, etc.
-        Only return NULL if you genuinely cannot make a reasonable determination.
-        """
-        
-        user_content = f"""
-        Entity Information: {json.dumps(row_data)}
-        
-        Determine the {target_column} value for this entity.
-        """
+        # For direct extraction without web search
+        if 'country' in target_column.lower():
+            return f'''
+Based on the entity information provided, determine the most likely value for {target_column}.
+
+GEOGRAPHIC VALIDATION RULES:
+- Use city information to determine country (Montreal = Canada, Boston = USA, etc.)
+- Use email domains for company headquarters (bmo.com = Canada, usbank.com = USA)
+- Cross-validate city, state, and country for consistency
+- Known patterns:
+  * bmo.com → Canada (Bank of Montreal)
+  * usbank.com → United States  
+  * fmr.com → United States (Fidelity, Boston)
+  * nepc.com → United States (New England Pension Consultants, Boston)
+
+{base_format}
+
+Consider all geographic clues in the data. If city says "Boston", country should be "United States".
+Only return null if you genuinely cannot make a reasonable determination.
+'''
+            
+        elif 'state' in target_column.lower():
+            return f'''
+Based on the entity information provided, determine the most likely value for {target_column}.
+
+GEOGRAPHIC VALIDATION RULES - CRITICAL:
+- If city is provided, state MUST match the city's actual location
+- Common city-state mappings:
+  * Boston = Massachusetts
+  * Montreal = Quebec  
+  * Minneapolis = Minnesota
+  * New York = New York
+  * Chicago = Illinois
+  * Los Angeles = California
+  * Toronto = Ontario
+- Do NOT guess states - only return if you're confident about the city-state relationship
+- For non-US locations, use appropriate regional divisions (provinces, länder, etc.)
+
+{base_format}
+
+IMPORTANT: Return null rather than guessing if you're not certain about the geographic relationship.
+Skip determination on individuals with personal email domains.
+'''
+        else:
+            return f'''
+Based on the entity information provided, determine the most likely value for {target_column}.
+{base_format}
+Consider typical patterns in the data and use logical reasoning.
+Only return null if you genuinely cannot make a reasonable determination.
+'''
+
+def generate_user_content(row_data: Dict[str, Any], context: str, target_column: str, using_tavily: bool = True) -> str:
+    """Generate improved user content with geographic context."""
+    
+    # Extract key geographic info from row
+    city_info = ""
+    state_info = ""
+    country_info = ""
+    
+    for col, value in row_data.items():
+        if 'city' in col.lower() and value and str(value).strip() and str(value).strip() != 'None':
+            city_info = f"City: {value}"
+        elif 'state' in col.lower() and value and str(value).strip() and str(value).strip() != 'None':
+            state_info = f"State: {value}"
+        elif 'country' in col.lower() and value and str(value).strip() and str(value).strip() != 'None':
+            country_info = f"Country: {value}"
+    
+    geographic_context = f"{city_info} {state_info} {country_info}".strip()
+    
+    if using_tavily:
+        return f'''
+Entity Information: {json.dumps(row_data)}
+
+Geographic Context: {geographic_context}
+
+Search Results: {context}
+
+Extract the {target_column} value for this entity.
+
+IMPORTANT: Ensure geographic consistency - if extracting state and city is "Boston", 
+the state must be "Massachusetts". Cross-validate your answer against known geography.
+'''
+    else:
+        return f'''
+Entity Information: {json.dumps(row_data)}
+
+Geographic Context: {geographic_context}
+
+Determine the {target_column} value for this entity.
+
+CRITICAL: Use the geographic context above to ensure consistency. 
+For example, if City is "Boston", State must be "Massachusetts" and Country must be "United States".
+'''
+
+def extract_data_with_claude(row_data: Dict[str, Any], context: str, target_column: str, claude_api_key: str, using_tavily: bool = True) -> Any:
+    """Extract specific data from context using Claude with improved prompts."""
+    
+    # Get improved system prompt
+    system_prompt = get_improved_system_prompt(target_column, using_tavily)
+    
+    # Get improved user content
+    user_content = generate_user_content(row_data, context, target_column, using_tavily)
     
     try:
         # Create Anthropic client with only the API key parameter
@@ -368,41 +568,57 @@ def process_row_concurrent(
             if email_domain:
                 company_from_email = email_domain.split('.')[0].capitalize()
     
-    # Extract existing city data for context if available
+    # Extract existing location data for context
     existing_city = None
-    for col in row_data:
-        if 'city' in col.lower() and pd.notna(row_data[col]) and str(row_data[col]).strip():
-            existing_city = str(row_data[col]).strip()
-            break
+    existing_state = None
+    existing_country = None
     
-    for target_column in target_columns:
+    for col in row_data:
+        if 'city' in col.lower() and pd.notna(row_data[col]) and str(row_data[col]).strip() and str(row_data[col]).strip() != 'None':
+            existing_city = str(row_data[col]).strip()
+        elif 'state' in col.lower() and pd.notna(row_data[col]) and str(row_data[col]).strip() and str(row_data[col]).strip() != 'None':
+            existing_state = str(row_data[col]).strip()
+        elif 'country' in col.lower() and pd.notna(row_data[col]) and str(row_data[col]).strip() and str(row_data[col]).strip() != 'None':
+            existing_country = str(row_data[col]).strip()
+    
+    # Process columns in geographic order for consistency
+    ordered_columns = get_processing_order(target_columns)
+    
+    for target_column in ordered_columns:
         # Skip if value already exists and overwrite is not enabled
         current_value = row_data.get(target_column)
-        if not overwrite_existing and pd.notna(current_value) and str(current_value).strip():
+        if not overwrite_existing and pd.notna(current_value) and str(current_value).strip() and str(current_value).strip() != 'None':
             continue
             
         # Check if we already have the value from our known domains
-        if known_company_info and target_column.lower() in ["country", "city"]:
-            if target_column.lower() == "country" and "country" in known_company_info:
-                results[target_column] = known_company_info["country"]
-                continue
-            elif target_column.lower() == "city" and "city" in known_company_info:
-                results[target_column] = known_company_info["city"]
+        if known_company_info:
+            domain_key = target_column.lower()
+            if domain_key in known_company_info:
+                results[target_column] = known_company_info[domain_key]
                 continue
             
-        # Generate search query with additional context
+        # Generate search query with enhanced context
         search_context = search_contexts.get(target_column, "")
         
-        # Add email domain to context for better search results
+        # Enhanced context generation based on target column and existing data
         enhanced_context = search_context
-        if email_domain and 'country' in target_column.lower():
-            enhanced_context = f"{search_context} {email_domain} headquarters country"
-        elif email_domain:
-            enhanced_context = f"{search_context} {email_domain}"
-            
-        # Add existing city to context when searching for country
-        if existing_city and 'country' in target_column.lower():
-            enhanced_context = f"{enhanced_context} {existing_city}"
+        if email_domain:
+            if 'country' in target_column.lower():
+                enhanced_context = f"{search_context} {email_domain} headquarters country"
+            elif 'state' in target_column.lower():
+                enhanced_context = f"{search_context} {email_domain} state location"
+            else:
+                enhanced_context = f"{search_context} {email_domain}"
+        
+        # Add existing geographic data to context
+        if existing_city:
+            if 'country' in target_column.lower():
+                enhanced_context = f"{enhanced_context} {existing_city} country location"
+            elif 'state' in target_column.lower():
+                enhanced_context = f"{enhanced_context} {existing_city} state province region"
+        
+        if existing_state and 'country' in target_column.lower():
+            enhanced_context = f"{enhanced_context} {existing_state}"
             
         # Generate the search query
         search_query = generate_search_query(row_data, target_column, enhanced_context)
@@ -420,13 +636,19 @@ def process_row_concurrent(
         
         # If we have search results or using Claude direct is enabled
         if tavily_context or use_claude_direct:
-            # Create enhanced row data with domain info
+            # Create enhanced row data with domain info and current results
             enhanced_row_data = row_data.copy()
+            enhanced_row_data.update(results)  # Include results from previous columns
+            
             if email_domain and company_from_email:
                 enhanced_row_data['_derived_company_domain'] = email_domain
                 enhanced_row_data['_derived_company_name'] = company_from_email
             if existing_city:
                 enhanced_row_data['_derived_city'] = existing_city
+            if existing_state:
+                enhanced_row_data['_derived_state'] = existing_state
+            if existing_country:
+                enhanced_row_data['_derived_country'] = existing_country
             
             # If no Tavily results but Claude direct is enabled, use row data as context
             context_for_claude = tavily_context if tavily_context else json.dumps(enhanced_row_data)
@@ -437,12 +659,15 @@ def process_row_concurrent(
                 context_for_claude, 
                 target_column, 
                 claude_api_key,
-                use_tavily  # Pass whether we're using Tavily to adjust Claude's approach
+                bool(tavily_context)  # Pass whether we're using Tavily results
             )
             
             # Store extracted data
-            if extracted_value:
+            if extracted_value and str(extracted_value).strip() and str(extracted_value).strip().lower() != 'null':
                 results[target_column] = extracted_value
+    
+    # Validate geographic consistency before returning
+    results = validate_geographic_consistency(results, row_data)
     
     return idx, results
 
@@ -596,6 +821,7 @@ def get_default_context(column_name: str) -> str:
     contexts = {
         "city": "headquarters location city",
         "country": "headquarters country",
+        "state": "headquarters state province region",
         "founded": "year founded established",
         "ceo": "chief executive officer current",
         "industry": "primary business sector industry",
@@ -644,12 +870,7 @@ def offer_download_options(df: pd.DataFrame):
 # Main app function
 def main():
     st.title("AI-Powered Excel Data Augmentation Tool")
-    
-    # Add a warning about Tavily API issues
-    st.warning("""
-    **Note:** We've noticed some users experiencing 432 Client Error with the Tavily API.
-    If you encounter this issue, you can still use this tool with Claude's direct data extraction (no web search).
-    """)
+    st.markdown("### Enhanced with Geographic Validation")
     
     # Sidebar for API keys
     st.sidebar.header("API Configuration")
@@ -769,6 +990,10 @@ def main():
             # Show sample of data
             st.subheader("Data Preview")
             st.dataframe(df.head())
+            
+            # Geographic validation info
+            if any(geo_term in col.lower() for col in target_columns for geo_term in ['city', 'state', 'country']):
+                st.info("🌍 Geographic validation enabled - the system will automatically correct inconsistent city/state/country combinations")
             
             # Processing button
             process_button = st.button("Process Data")
@@ -953,7 +1178,7 @@ def main():
             st.error(f"Error processing file: {str(e)}")
             if st.session_state.debug_mode:
                 st.error(f"Exception details: {traceback.format_exc()}")
-    
+
 if __name__ == "__main__":
     try:
         main()
