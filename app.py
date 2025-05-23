@@ -12,17 +12,25 @@ import re
 import concurrent.futures
 from datetime import datetime
 import math
+from openai import OpenAI
 
 # Set page config
 st.set_page_config(
-    page_title="AI-Powered Excel Data Augmentation Tool",
-    page_icon="🔍",
+    page_title="CatenaryLM",
+    page_icon="⛓️",
     layout="wide"
 )
 
 # Define debug function early - this avoids potential reference issues
 if 'debug_mode' not in st.session_state:
     st.session_state.debug_mode = False
+
+if 'processed_df' not in st.session_state:
+    st.session_state.processed_df = None
+if 'test_batch_completed' not in st.session_state:
+    st.session_state.test_batch_completed = False
+if 'processing_complete' not in st.session_state:
+    st.session_state.processing_complete = False
 
 def setup_debug():
     if st.session_state.debug_mode:
@@ -142,74 +150,167 @@ def get_geographic_mappings() -> Dict[str, Dict[str, str]]:
         'Seattle': {'state': 'Washington', 'country': 'United States'},
         'Vancouver': {'state': 'British Columbia', 'country': 'Canada'},
         'Calgary': {'state': 'Alberta', 'country': 'Canada'},
-        'Ottawa': {'state': 'Ontario', 'country': 'Canada'}
+        'Ottawa': {'state': 'Ontario', 'country': 'Canada'},
+        'Arlington': {'state': 'Virginia', 'country': 'United States'},
+        'Durham': {'state': 'North Carolina', 'country': 'United States'},
+        'Farmington': {'state': 'Connecticut', 'country': 'United States'}
     }
 
-# Function to validate geographic consistency
-def validate_geographic_consistency(results: Dict[str, Any], row_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Validate and correct geographic inconsistencies."""
+def get_confidence_score(search_result: Dict[str, Any], extracted_value: str) -> float:
+    """Calculate confidence score based on search results and extraction quality."""
+    if not search_result or "error" in search_result:
+        return 0.0
+    
+    confidence = 0.0
+    
+    # Base confidence from having search results
+    if search_result.get('answer') or search_result.get('content'):
+        confidence += 0.3
+    
+    # Higher confidence for specific, non-vague answers
+    if extracted_value and len(str(extracted_value).strip()) > 2:
+        confidence += 0.2
+    
+    # Penalty for vague answers
+    vague_terms = ['unknown', 'various', 'multiple', 'unclear', 'not specified']
+    if any(term in str(extracted_value).lower() for term in vague_terms):
+        confidence -= 0.3
+    
+    return min(1.0, max(0.0, confidence))
+
+def validate_geographic_consistency_advanced(results: Dict[str, Any], row_data: Dict[str, Any], 
+                                           target_columns: List[str],
+                                           confidence_scores: Dict[str, float] = None) -> Dict[str, Any]:
+    """Advanced geographic validation with confidence-based decisions and override capability."""
+    
+    if confidence_scores is None:
+        confidence_scores = {}
+    
     # Get all location data (existing + newly filled)
     all_data = {**row_data, **results}
     
-    city = state = country = None
-    city_col = state_col = country_col = None
-    
-    # Extract location information and track column names
+    # Extract current values and identify columns - BUT ONLY FOR TARGET COLUMNS
+    location_data = {}
     for col, value in all_data.items():
-        if 'city' in col.lower() and value and str(value).strip() and str(value).strip() != 'None':
-            city = str(value).strip()
-            city_col = col
-        elif 'state' in col.lower() and value and str(value).strip() and str(value).strip() != 'None':
-            state = str(value).strip()
-            state_col = col
-        elif 'country' in col.lower() and value and str(value).strip() and str(value).strip() != 'None':
-            country = str(value).strip()
-            country_col = col
+        # ONLY process columns that are in target_columns
+        if col not in target_columns:
+            continue
+            
+        if 'city' in col.lower():
+            location_data['city'] = {'value': value, 'column': col, 'confidence': confidence_scores.get(col, 0.0)}
+        elif 'state' in col.lower():
+            location_data['state'] = {'value': value, 'column': col, 'confidence': confidence_scores.get(col, 0.0)}
+        elif 'country' in col.lower():
+            location_data['country'] = {'value': value, 'column': col, 'confidence': confidence_scores.get(col, 0.0)}
     
-    # Get known mappings
+    # Clean up None/null values
+    for loc_type in location_data:
+        val = location_data[loc_type]['value']
+        if not val or str(val).strip() in ['None', 'null', '']:
+            location_data[loc_type]['value'] = None
+            location_data[loc_type]['confidence'] = 0.0
+    
+    # Get known mappings for validation
     known_mappings = get_geographic_mappings()
     
-    # Validate and correct if needed
-    if city and city in known_mappings:
-        expected = known_mappings[city]
+    # Strategy 1: Use known financial domains first (highest confidence)
+    email_domain = None
+    for col, value in row_data.items():
+        if 'email' in col.lower() and value and '@' in str(value):
+            email_domain = str(value).split('@')[1]
+            break
+    
+    financial_domains = get_financial_domain_info()
+    if email_domain and email_domain in financial_domains:
+        domain_info = financial_domains[email_domain]
+        st.debug(f"Using known financial domain data for {email_domain}")
         
-        # Correct state if it's wrong and we have a state column in results
-        if state and state != expected['state'] and state_col and state_col in results:
-            st.debug(f"Correcting state from {state} to {expected['state']} for city {city}")
-            results[state_col] = expected['state']
+        # Override with high-confidence domain data
+        for geo_type in ['country', 'state', 'city']:
+            if geo_type in location_data and geo_type in domain_info:
+                if location_data[geo_type]['confidence'] < 0.9:  # Only override if not very confident
+                    st.debug(f"Overriding {geo_type} with domain data: {domain_info[geo_type]}")
+                    results[location_data[geo_type]['column']] = domain_info[geo_type]
+                    location_data[geo_type]['value'] = domain_info[geo_type]
+                    location_data[geo_type]['confidence'] = 0.95
+    
+    # Strategy 2: Use geographic validation rules
+    city_value = location_data.get('city', {}).get('value')
+    if city_value and city_value in known_mappings:
+        expected = known_mappings[city_value]
+        st.debug(f"Found geographic mapping for city: {city_value}")
+        
+        # Handle country
+        if 'country' in location_data:
+            country_col = location_data['country']['column']
+            current_country = location_data['country']['value']
+            current_confidence = location_data['country']['confidence']
+            expected_country = expected['country']
             
-        # Correct country if it's wrong and we have a country column in results
-        if country and country != expected['country'] and country_col and country_col in results:
-            st.debug(f"Correcting country from {country} to {expected['country']} for city {city}")
-            results[country_col] = expected['country']
+            should_override = (
+                not current_country or  # Missing
+                current_confidence < 0.7 or  # Low confidence
+                (current_country != expected_country and current_confidence < 0.8)  # Wrong but not very confident
+            )
             
-        # Fill in missing state if we have a state column in results but no value
-        if not state and state_col and state_col in results:
-            st.debug(f"Adding missing state {expected['state']} for city {city}")
-            results[state_col] = expected['state']
+            if should_override:
+                st.debug(f"Setting country to {expected_country} for city {city_value} (confidence override)")
+                results[country_col] = expected_country
+                confidence_scores[country_col] = 0.8  # Geographic validation confidence
+                location_data['country']['value'] = expected_country
+        
+        # Handle state
+        if 'state' in location_data:
+            state_col = location_data['state']['column']
+            current_state = location_data['state']['value']
+            current_confidence = location_data['state']['confidence']
+            expected_state = expected['state']
             
-        # Fill in missing country if we have a country column in results but no value
-        if not country and country_col and country_col in results:
-            st.debug(f"Adding missing country {expected['country']} for city {city}")
-            results[country_col] = expected['country']
+            should_override = (
+                not current_state or  # Missing
+                current_confidence < 0.7 or  # Low confidence
+                (current_state != expected_state and current_confidence < 0.8)  # Wrong but not very confident
+            )
+            
+            if should_override:
+                st.debug(f"Setting state to {expected_state} for city {city_value} (confidence override)")
+                results[state_col] = expected_state
+                location_data['state']['value'] = expected_state
+    
+    # Strategy 3: Cross-validate between fields
+    # If we have high-confidence country and city, validate state
+    if (location_data.get('country', {}).get('confidence', 0) > 0.8 and 
+        location_data.get('city', {}).get('confidence', 0) > 0.8 and
+        'state' in location_data):
+        
+        city_val = location_data['city']['value']
+        if city_val and city_val in known_mappings:
+            expected_state = known_mappings[city_val]['state']
+            current_state = location_data['state']['value']
+            
+            if (not current_state or 
+                location_data['state']['confidence'] < 0.6 or
+                current_state != expected_state):
+                
+                st.debug(f"Cross-validating state: setting to {expected_state} based on high-confidence city/country")
+                results[location_data['state']['column']] = expected_state
     
     return results
 
-# Function to get processing order for geographic consistency
-def get_processing_order(target_columns: List[str]) -> List[str]:
-    """Return columns in logical processing order for geographic consistency."""
-    # Process geographic fields in logical order: country -> state -> city
+def get_processing_order_optimized(target_columns: List[str]) -> List[str]:
+    """Return columns in optimal processing order: country -> state -> city -> others."""
+    # Start with country (most general, easiest to determine)
     priority_order = ['country', 'state', 'province', 'region', 'city']
     ordered_columns = []
     remaining_columns = []
     
-    # First, add geographic columns in order
+    # Add geographic columns in order of decreasing generality
     for priority in priority_order:
         for col in target_columns:
             if priority in col.lower() and col not in ordered_columns:
                 ordered_columns.append(col)
     
-    # Then add remaining columns
+    # Add non-geographic columns
     for col in target_columns:
         if col not in ordered_columns:
             remaining_columns.append(col)
@@ -227,22 +328,19 @@ def search_with_tavily(query: str, api_key: str) -> Dict[str, Any]:
         }
         payload = {
             "query": query,
-            "search_depth": "basic",  # Changed from advanced to basic for fewer potential errors
+            "search_depth": "basic",
             "include_answer": True,
             "include_domains": ["wikipedia.org", "crunchbase.com", "linkedin.com", "bloomberg.com", "forbes.com", 
                                "marketwatch.com", "investing.com", "ft.com", "wsj.com", "reuters.com"],
-            "max_results": 3  # Reduced for quicker response
+            "max_results": 3
         }
         
-        # Debug info
         st.debug(f"Sending query to Tavily: {query}")
         
         response = requests.post(url, json=payload, headers=headers)
         
-        # Check for specific error codes
         if response.status_code == 432 or response.status_code == 401:
             st.warning(f"Authentication issue with Tavily API (Status Code: {response.status_code}). Check your API key.")
-            # Return a structured error response
             return {
                 "error": "auth_error",
                 "status_code": response.status_code,
@@ -273,6 +371,51 @@ def search_with_tavily(query: str, api_key: str) -> Dict[str, Any]:
         return {
             "error": "unknown_error",
             "answer": "",
+            "results": []
+        }
+
+# Function to search with Perplexity
+def search_with_perplexity(query: str, api_key: str) -> Dict[str, Any]:
+    """Use Perplexity AI to search for information."""
+    try:
+        st.debug(f"Sending query to Perplexity: {query}")
+        
+        client = OpenAI(api_key=api_key, base_url="https://api.perplexity.ai")
+        
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful research assistant. Provide accurate, factual information "
+                    "based on reliable sources. Focus on providing specific, verifiable details."
+                ),
+            },
+            {
+                "role": "user",
+                "content": query,
+            },
+        ]
+        
+        response = client.chat.completions.create(
+            model="sonar",
+            messages=messages,
+        )
+        
+        result = {
+            "answer": response.choices[0].message.content,
+            "content": response.choices[0].message.content,
+            "results": [{"content": response.choices[0].message.content}]
+        }
+        
+        st.debug(f"Perplexity search successful for: {query}")
+        return result
+        
+    except Exception as e:
+        st.error(f"Error with Perplexity search: {str(e)}")
+        return {
+            "error": "perplexity_error",
+            "answer": "",
+            "content": "",
             "results": []
         }
 
@@ -313,7 +456,7 @@ def generate_search_query(row_data: Dict[str, Any], target_column: str, search_c
     query = f"{entity_name} {target_column} {search_context}".strip()
     return query
 
-def get_improved_system_prompt(target_column: str, using_tavily: bool = True) -> str:
+def get_improved_system_prompt(target_column: str, using_web_search: bool = True) -> str:
     """Generate improved system prompts with geographic validation."""
     
     # Base format
@@ -326,8 +469,8 @@ Return format:
 }}
 '''
     
-    if using_tavily:
-        # For Tavily search results
+    if using_web_search:
+        # For web search results
         if 'country' in target_column.lower():
             return f'''
 Extract the {target_column} for the entity from the provided search results.
@@ -418,7 +561,7 @@ Consider typical patterns in the data and use logical reasoning.
 Only return null if you genuinely cannot make a reasonable determination.
 '''
 
-def generate_user_content(row_data: Dict[str, Any], context: str, target_column: str, using_tavily: bool = True) -> str:
+def generate_user_content(row_data: Dict[str, Any], context: str, target_column: str, using_web_search: bool = True) -> str:
     """Generate improved user content with geographic context."""
     
     # Extract key geographic info from row
@@ -436,7 +579,7 @@ def generate_user_content(row_data: Dict[str, Any], context: str, target_column:
     
     geographic_context = f"{city_info} {state_info} {country_info}".strip()
     
-    if using_tavily:
+    if using_web_search:
         return f'''
 Entity Information: {json.dumps(row_data)}
 
@@ -461,68 +604,82 @@ CRITICAL: Use the geographic context above to ensure consistency.
 For example, if City is "Boston", State must be "Massachusetts" and Country must be "United States".
 '''
 
-def extract_data_with_claude(row_data: Dict[str, Any], context: str, target_column: str, claude_api_key: str, using_tavily: bool = True) -> Any:
-    """Extract specific data from context using Claude with improved prompts."""
+def extract_data_with_claude_confidence(row_data: Dict[str, Any], context: str, target_column: str, 
+                                      claude_api_key: str, using_web_search: bool = True, 
+                                      search_result: Dict[str, Any] = None) -> Tuple[Any, float]:
+    """Extract data with Claude and return both value and confidence score."""
     
-    # Get improved system prompt
-    system_prompt = get_improved_system_prompt(target_column, using_tavily)
+    # Enhanced system prompt with confidence requirements
+    if using_web_search and search_result:
+        confidence_instruction = """
+        CONFIDENCE REQUIREMENTS:
+        - Only return a value if you are highly confident (80%+ certainty)
+        - If search results are vague, contradictory, or incomplete, return null
+        - Prefer returning null over guessing
+        - Look for multiple confirming sources in the search results
+        """
+    else:
+        confidence_instruction = """
+        CONFIDENCE REQUIREMENTS:
+        - Only return a value if you can determine it with high confidence from the entity data
+        - Use email domains and existing geographic data as strong indicators
+        - If you cannot make a confident determination, return null
+        - Do not guess or make assumptions
+        """
     
-    # Get improved user content
-    user_content = generate_user_content(row_data, context, target_column, using_tavily)
+    # Get standard prompts and add confidence instruction
+    system_prompt = get_improved_system_prompt(target_column, using_web_search)
+    system_prompt += confidence_instruction
+    
+    user_content = generate_user_content(row_data, context, target_column, using_web_search)
     
     try:
-        # Create Anthropic client with only the API key parameter
-        try:
-            # Import inside function to ensure fresh import
-            from anthropic import Anthropic
-            client = Anthropic(api_key=claude_api_key)
-        except Exception as client_error:
-            st.debug(f"Error creating Claude client: {str(client_error)}")
-            return None
+        from anthropic import Anthropic
+        client = Anthropic(api_key=claude_api_key)
         
-        try:
-            response = client.messages.create(
-                model="claude-3-haiku-20240307",
-                max_tokens=1000,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_content}]
-            )
-        except Exception as request_error:
-            st.debug(f"Error during Claude API request: {str(request_error)}")
-            return None
+        response = client.messages.create(
+            model="claude-3-haiku-20240307",
+            max_tokens=1000,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_content}]
+        )
         
-        # Extract response
-        try:
-            json_str = extract_json_from_response(response.content[0].text)
-            result = json.loads(json_str)
-            return result.get(target_column)
-        except Exception as parse_error:
-            st.debug(f"Error parsing Claude response: {str(parse_error)}")
-            return None
-            
+        json_str = extract_json_from_response(response.content[0].text)
+        result = json.loads(json_str)
+        extracted_value = result.get(target_column)
+        
+        # Calculate confidence score
+        confidence = 0.5  # Base confidence for Claude extraction
+        
+        if using_web_search and search_result:
+            confidence = get_confidence_score(search_result, extracted_value)
+        else:
+            # Direct extraction confidence
+            if extracted_value:
+                # Higher confidence for email domain matches
+                if any('email' in col.lower() for col in row_data):
+                    confidence += 0.3
+                # Higher confidence for geographic consistency
+                if target_column.lower() in ['country', 'state'] and any('city' in col.lower() for col in row_data):
+                    confidence += 0.2
+        
+        return extracted_value, confidence
+        
     except Exception as e:
         st.debug(f"Error extracting data with Claude: {str(e)}")
-        return None
+        return None, 0.0
 
-# Process a single row (for concurrent processing)
-def process_row_concurrent(
-    args: Tuple
-) -> Tuple[int, Dict[str, Any]]:
-    """Process a single row concurrently and return results."""
+# Process a single row (for concurrent processing) - OPTIMIZED VERSION
+def process_row_concurrent(args: Tuple) -> Tuple[int, Dict[str, Any], Dict[str, float]]:
+    """Optimized row processing with confidence-based decisions."""
     (
-        row_data, 
-        idx, 
-        target_columns,
-        search_contexts,
-        claude_api_key, 
-        tavily_api_key,
-        use_tavily,
-        use_claude_direct,
-        overwrite_existing,
-        skip_non_company_emails
+        row_data, idx, target_columns, search_contexts,
+        claude_api_key, search_api_key, search_provider, use_web_search, use_claude_direct,
+        overwrite_existing, skip_non_company_emails
     ) = args
     
     results = {}
+    confidence_scores = {}
     
     # Look for email field
     email_field = None
@@ -539,13 +696,10 @@ def process_row_concurrent(
     
     # Check if we should skip this row (individual without company email)
     if skip_non_company_emails and email_field and email_value:
-        # Skip if no email or it's not a company email
         if '@' not in email_value:
-            return idx, {}
-            
-        # Check if this appears to be a personal email
+            return idx, {}, {}
         if not is_company_email(email_value):
-            return idx, {}
+            return idx, {}, {}
     
     # Extract domain from email for context if available
     email_domain = None
@@ -577,22 +731,25 @@ def process_row_concurrent(
         elif 'country' in col.lower() and pd.notna(row_data[col]) and str(row_data[col]).strip() and str(row_data[col]).strip() != 'None':
             existing_country = str(row_data[col]).strip()
     
-    # Process columns in geographic order for consistency
-    ordered_columns = get_processing_order(target_columns)
+    # Process columns in optimized order (country first)
+    ordered_columns = get_processing_order_optimized(target_columns)
     
     for target_column in ordered_columns:
-        # Skip if value already exists and overwrite is not enabled
+        # Skip if high-confidence value exists and overwrite is disabled
         current_value = row_data.get(target_column)
-        if not overwrite_existing and pd.notna(current_value) and str(current_value).strip() and str(current_value).strip() != 'None':
+        if (not overwrite_existing and current_value and 
+            str(current_value).strip() not in ['None', 'null', '']):
             continue
-            
+        
         # Check if we already have the value from our known domains
         if known_company_info:
             domain_key = target_column.lower()
             if domain_key in known_company_info:
                 results[target_column] = known_company_info[domain_key]
+                confidence_scores[target_column] = 0.95  # High confidence for known domains
+                st.debug(f"Using known domain data: {target_column}={known_company_info[domain_key]}")
                 continue
-            
+        
         # Generate search query with enhanced context
         search_context = search_contexts.get(target_column, "")
         
@@ -615,23 +772,24 @@ def process_row_concurrent(
         
         if existing_state and 'country' in target_column.lower():
             enhanced_context = f"{enhanced_context} {existing_state}"
-            
+        
         # Generate the search query
         search_query = generate_search_query(row_data, target_column, enhanced_context)
         
-        tavily_context = ""
+        # Perform search and extraction
+        web_context = ""
+        search_result = {}
         
-        # Only use Tavily if enabled
-        if use_tavily:
-            # Perform search with Tavily
-            search_result = search_with_tavily(search_query, tavily_api_key)
-            
-            # Check for errors in Tavily response
+        if use_web_search:
+            if search_provider == "perplexity":
+                search_result = search_with_perplexity(search_query, search_api_key)
+            else:  # tavily
+                search_result = search_with_tavily(search_query, search_api_key)
+                
             if "error" not in search_result:
-                tavily_context = search_result.get('answer', '')
+                web_context = search_result.get('answer', '') or search_result.get('content', '')
         
-        # If we have search results or using Claude direct is enabled
-        if tavily_context or use_claude_direct:
+        if web_context or use_claude_direct:
             # Create enhanced row data with domain info and current results
             enhanced_row_data = row_data.copy()
             enhanced_row_data.update(results)  # Include results from previous columns
@@ -646,26 +804,28 @@ def process_row_concurrent(
             if existing_country:
                 enhanced_row_data['_derived_country'] = existing_country
             
-            # If no Tavily results but Claude direct is enabled, use row data as context
-            context_for_claude = tavily_context if tavily_context else json.dumps(enhanced_row_data)
+            context_for_claude = web_context if web_context else json.dumps(enhanced_row_data)
             
-            # Extract the target data using Claude
-            extracted_value = extract_data_with_claude(
-                enhanced_row_data, 
-                context_for_claude, 
-                target_column, 
-                claude_api_key,
-                bool(tavily_context)  # Pass whether we're using Tavily results
+            # Extract with confidence scoring
+            extracted_value, confidence = extract_data_with_claude_confidence(
+                enhanced_row_data, context_for_claude, target_column, 
+                claude_api_key, bool(web_context), search_result
             )
             
-            # Store extracted data
-            if extracted_value and str(extracted_value).strip() and str(extracted_value).strip().lower() != 'null':
+            # Only store high-confidence results
+            CONFIDENCE_THRESHOLD = 0.6 # Adjustable threshold
+            if (extracted_value and confidence >= CONFIDENCE_THRESHOLD and
+                str(extracted_value).strip().lower() not in ['null', 'none', '']):
                 results[target_column] = extracted_value
+                confidence_scores[target_column] = confidence
+                st.debug(f"Stored {target_column}={extracted_value} (confidence: {confidence:.2f})")
+            else:
+                st.debug(f"Rejected {target_column}={extracted_value} (confidence: {confidence:.2f} < {CONFIDENCE_THRESHOLD})")
     
-    # Validate geographic consistency before returning
-    results = validate_geographic_consistency(results, row_data)
+    # Apply advanced geographic validation with confidence scores
+    results = validate_geographic_consistency_advanced(results, row_data, target_columns, confidence_scores)
     
-    return idx, results
+    return idx, results, confidence_scores
 
 # Function to process a batch of rows
 def process_batch(
@@ -675,18 +835,20 @@ def process_batch(
     target_columns: List[str],
     search_contexts: Dict[str, str],
     claude_api_key: str, 
-    tavily_api_key: str,
-    use_tavily: bool,
+    search_api_key: str,
+    search_provider: str,
+    use_web_search: bool,
     use_claude_direct: bool,
     overwrite_existing: bool,
     skip_non_company_emails: bool = True,
     progress_bar: Any = None,
     auto_save: bool = False,
-    auto_save_interval: int = 50,  # Save every 50 rows by default
+    auto_save_interval: int = 50,
     input_filename: str = "data",
     auto_save_directory: str = "./data_exports",
     use_concurrent: bool = True,
-    max_workers: int = 4
+    max_workers: int = 4,
+    add_confidence_columns: bool = False
 ) -> pd.DataFrame:
     """Process a batch of rows to augment with AI-generated data."""
     
@@ -705,8 +867,9 @@ def process_batch(
                 target_columns,
                 search_contexts,
                 claude_api_key, 
-                tavily_api_key,
-                use_tavily,
+                search_api_key,
+                search_provider,
+                use_web_search,
                 use_claude_direct,
                 overwrite_existing,
                 skip_non_company_emails
@@ -714,7 +877,6 @@ def process_batch(
             process_args.append(args)
         
         # Calculate appropriate number of workers
-        # Not too many to avoid API rate limits, but enough for parallelism
         actual_workers = min(max_workers, total_rows)
         
         # Counter for auto-saving
@@ -722,7 +884,7 @@ def process_batch(
         last_save_idx = 0
         
         # Process in chunks to avoid memory issues with very large files
-        chunk_size = min(100, total_rows)  # Process in chunks of 100 rows
+        chunk_size = min(100, total_rows)
         for chunk_start in range(0, total_rows, chunk_size):
             chunk_end = min(chunk_start + chunk_size, total_rows)
             chunk_args = process_args[chunk_start:chunk_end]
@@ -734,11 +896,18 @@ def process_batch(
                 
                 # Process as they complete
                 for future in concurrent.futures.as_completed(future_to_idx):
-                    idx, results = future.result()
+                    idx, results, confidence_scores = future.result()
                     
                     # Update the dataframe with results
                     for col, value in results.items():
                         df.at[idx, col] = value
+                        
+                        # ADD CONFIDENCE COLUMNS if requested
+                        if add_confidence_columns and col in confidence_scores:
+                            confidence_col = f"{col}_confidence"
+                            if confidence_col not in df.columns:
+                                df[confidence_col] = None
+                            df.at[idx, confidence_col] = round(confidence_scores[col], 2)
                     
                     # Update counter
                     rows_processed += 1
@@ -751,7 +920,6 @@ def process_batch(
                     if auto_save and (rows_processed % auto_save_interval == 0):
                         auto_save_path = auto_save_data(df, prefix=f"{input_filename}_partial", directory=auto_save_directory)
                         if auto_save_path:
-                            # Use st.debug instead of st.info to avoid cluttering the UI
                             st.debug(f"Auto-saved progress to {auto_save_path}")
                             last_save_idx = rows_processed
             
@@ -767,18 +935,17 @@ def process_batch(
         last_save_idx = 0
         
         for idx in range(start_idx, actual_end_idx):
-            # Convert row to dict
             row_data = df.iloc[idx].to_dict()
             
-            # Process the row using a simplified version of process_row_concurrent
-            _, results = process_row_concurrent((
+            _, results, confidence_scores = process_row_concurrent((
                 row_data, 
                 idx, 
                 target_columns,
                 search_contexts,
                 claude_api_key, 
-                tavily_api_key,
-                use_tavily,
+                search_api_key,
+                search_provider,
+                use_web_search,
                 use_claude_direct,
                 overwrite_existing,
                 skip_non_company_emails
@@ -787,6 +954,13 @@ def process_batch(
             # Update the dataframe with results
             for col, value in results.items():
                 df.at[idx, col] = value
+                
+                # ADD CONFIDENCE COLUMNS if requested
+                if add_confidence_columns and col in confidence_scores:
+                    confidence_col = f"{col}_confidence"
+                    if confidence_col not in df.columns:
+                        df[confidence_col] = None
+                    df.at[idx, confidence_col] = round(confidence_scores[col], 2)
             
             # Update counter
             rows_processed += 1
@@ -863,9 +1037,29 @@ def offer_download_options(df: pd.DataFrame):
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
+def calculate_confidence_statistics(df: pd.DataFrame, target_columns: List[str]) -> Dict[str, Any]:
+    """Calculate confidence statistics for processed data."""
+    stats = {}
+    
+    for col in target_columns:
+        confidence_col = f"{col}_confidence"
+        if confidence_col in df.columns:
+            confidence_values = df[confidence_col].dropna()
+            if len(confidence_values) > 0:
+                stats[col] = {
+                    'mean': round(confidence_values.mean(), 2),
+                    'min': round(confidence_values.min(), 2),
+                    'max': round(confidence_values.max(), 2),
+                    'count': len(confidence_values),
+                    'high_confidence': len(confidence_values[confidence_values >= 0.8]),
+                    'low_confidence': len(confidence_values[confidence_values < 0.6])
+                }
+    
+    return stats
+
 def main():
-    st.title("AI-Powered Excel Data Augmentation Tool")
-    st.markdown("### Enhanced with Geographic Validation")
+    st.title("CatenaryLM - Excel Assistant")
+    st.markdown("### Enhanced with Geographic Validation & Confidence Scoring")
     
     # Sidebar for API keys
     st.sidebar.header("API Configuration")
@@ -873,21 +1067,38 @@ def main():
     # Try to get API keys from Streamlit secrets first, then fall back to user input
     try:
         claude_api_key = st.secrets["CLAUDE_API_KEY"]
-        st.sidebar.success("✅ Claude API Key loaded from secrets")
+        st.sidebar.success("Claude API Key loaded from secrets")
     except:
         claude_api_key = st.sidebar.text_input("Claude API Key", type="password", 
                                             help="Enter your Anthropic Claude API key")
         if not claude_api_key:
-            st.sidebar.warning("⚠️ Claude API Key required")
+            st.sidebar.warning("Claude API Key required")
 
-    try:
-        tavily_api_key = st.secrets["TAVILY_API_KEY"]
-        st.sidebar.success("✅ Tavily API Key loaded from secrets")
-    except:
-        tavily_api_key = st.sidebar.text_input("Tavily API Key", type="password",
-                                            help="Enter your Tavily search API key")
-        if not tavily_api_key:
-            st.sidebar.warning("⚠️ Tavily API Key required")
+    # Search provider selection
+    search_provider = st.sidebar.radio(
+        "Search Provider",
+        ["perplexity", "tavily"],
+        help="Choose between Perplexity AI or Tavily for web search"
+    )
+    
+    if search_provider == "perplexity":
+        try:
+            search_api_key = st.secrets["PERPLEXITY_API_KEY"]
+            st.sidebar.success("Perplexity API Key loaded from secrets")
+        except:
+            search_api_key = st.sidebar.text_input("Perplexity API Key", type="password",
+                                                help="Enter your Perplexity AI API key")
+            if not search_api_key:
+                st.sidebar.warning("Perplexity API Key required")
+    else:
+        try:
+            search_api_key = st.secrets["TAVILY_API_KEY"]
+            st.sidebar.success("Tavily API Key loaded from secrets")
+        except:
+            search_api_key = st.sidebar.text_input("Tavily API Key", type="password",
+                                                help="Enter your Tavily search API key")
+            if not search_api_key:
+                st.sidebar.warning("Tavily API Key required")
     
     # Add debug mode toggle
     st.session_state.debug_mode = st.sidebar.checkbox("Enable Debug Mode", value=False)
@@ -895,8 +1106,8 @@ def main():
     
     # Sidebar for API options
     st.sidebar.header("API Options")
-    use_tavily = st.sidebar.checkbox("Use Tavily for web search", value=True, 
-                                   help="Disable if you're experiencing Tavily API errors")
+    use_web_search = st.sidebar.checkbox("Use web search", value=True, 
+                                       help="Disable if you're experiencing API errors")
     use_claude_direct = st.sidebar.checkbox("Use Claude's direct extraction", value=True,
                                           help="Claude will try to determine values even without web search")
     
@@ -945,12 +1156,13 @@ def main():
             
             # Column selections
             st.subheader("Select Columns to Augment")
-            st.markdown("Choose columns you want to fill with AI-powered searches. For each column, you can provide context for better search results.")
+            st.markdown("Choose columns you want to fill with AI-powered searches. The system will process **Country → State → City** in optimal order.")
             
             # Dynamically create multiselect for all columns
             target_columns = st.multiselect(
                 "Select columns to augment with AI searches",
-                options=list(df.columns)
+                options=list(df.columns),
+                help="Choose which columns you want the AI to fill with data"
             )
             
             # Context for each selected column
@@ -971,15 +1183,17 @@ def main():
             col1, col2 = st.columns(2)
             
             with col1:
-                test_mode = st.checkbox("Test Mode (process only a small batch)", value=True)
+                test_mode = st.checkbox("Test Mode (process small batch)", value=True)
                 test_batch_size = st.number_input("Test Batch Size", min_value=1, max_value=20, value=5)
             
             with col2:
-                # Advanced options
                 create_if_missing = st.checkbox("Create columns if they don't exist", value=True)
-                overwrite_existing = st.checkbox("Overwrite existing values", value=False)
-                skip_non_company_emails = st.checkbox("Skip entries without company emails", value=True, 
-                                                    help="Skip processing individuals with personal email domains like gmail.com")
+                overwrite_existing = st.checkbox("Overwrite existing values", value=True,
+                                               help="Override existing data if confidence is low")
+                skip_non_company_emails = st.checkbox("Skip personal emails", value=True, 
+                                                    help="Skip gmail.com, yahoo.com, etc.")
+                add_confidence_scores = st.checkbox("Add confidence score columns", value=False,
+                                                  help="Add columns showing AI confidence (0.0-1.0) for each filled value")
             
             # Ensure columns exist if needed
             if create_if_missing:
@@ -991,28 +1205,45 @@ def main():
             st.subheader("Data Preview")
             st.dataframe(df.head())
             
-            # Geographic validation info
+            # Enhanced features info
             if any(geo_term in col.lower() for col in target_columns for geo_term in ['city', 'state', 'country']):
-                st.info("🌍 Geographic validation enabled - the system will automatically correct inconsistent city/state/country combinations")
+                st.info("Geographic validation enabled - Automatic correction of inconsistent city/state/country combinations with confidence scoring")
+            
+            if any(email_col for email_col in df.columns if 'email' in email_col.lower()):
+                financial_domains = get_financial_domain_info()
+                domain_count = 0
+                for _, row in df.head(10).iterrows():
+                    for col in df.columns:
+                        if 'email' in col.lower() and pd.notna(row[col]) and '@' in str(row[col]):
+                            domain = str(row[col]).split('@')[1]
+                            if domain in financial_domains:
+                                domain_count += 1
+                                break
+                
+                if domain_count > 0:
+                    st.info(f"Known financial domains detected - High-confidence data available for {domain_count} entries in preview")
+            
+            if add_confidence_scores:
+                st.info("📊 Confidence scoring enabled - Additional columns will show AI certainty levels (0.0-1.0)")
             
             # Processing button
-            process_button = st.button("Process Data")
+            process_button = st.button("Start AI Processing", type="primary")
             
             if process_button:
                 if not claude_api_key:
                     st.error("Please provide a Claude API Key")
-                elif not tavily_api_key and use_tavily:
-                    st.warning("No Tavily API Key provided. Disabling Tavily search.")
-                    use_tavily = False
+                elif not search_api_key and use_web_search:
+                    st.warning(f"No {search_provider.title()} API Key provided. Disabling web search.")
+                    use_web_search = False
                 elif not target_columns:
                     st.error("Please select at least one column to augment")
-                elif not (use_tavily or use_claude_direct):
-                    st.error("Please enable at least one data source (Tavily or Claude direct extraction)")
+                elif not (use_web_search or use_claude_direct):
+                    st.error("Please enable at least one data source")
                 else:
                     # Check if all target columns exist
                     missing_columns = [col for col in target_columns if col not in df.columns]
                     if missing_columns and not create_if_missing:
-                        st.error(f"The following columns don't exist in your data: {', '.join(missing_columns)}. Enable 'Create columns if they don't exist' or select different columns.")
+                        st.error(f"The following columns don't exist: {', '.join(missing_columns)}. Enable 'Create columns if they don't exist' or select different columns.")
                     else:
                         # Store original data for comparison
                         original_df = df.copy()
@@ -1030,15 +1261,18 @@ def main():
                         # Show auto-save status if enabled
                         if enable_auto_save:
                             st.info(f"Auto-saving enabled. Files will be saved to {auto_save_directory} every {auto_save_interval} rows.")
-                            # Create directory if it doesn't exist
                             os.makedirs(auto_save_directory, exist_ok=True)
                         
                         # Show concurrency status
                         if use_concurrent:
-                            st.info(f"Concurrent processing enabled with {max_workers} workers.")
+                            st.info(f"⚡ Concurrent processing enabled with {max_workers} workers.")
+                        
+                        # Show processing strategy
+                        ordered_cols = get_processing_order_optimized(target_columns)
+                        if len(ordered_cols) > 1:
+                            st.info(f"🔄 Processing order: {' → '.join(ordered_cols)}")
                         
                         with st.spinner(f"Processing {'test batch' if test_mode else 'entire dataset'}..."):
-                            # Record the start time
                             start_time = time.time()
                             
                             # Process the data
@@ -1049,8 +1283,9 @@ def main():
                                 target_columns=target_columns,
                                 search_contexts=search_contexts,
                                 claude_api_key=claude_api_key, 
-                                tavily_api_key=tavily_api_key,
-                                use_tavily=use_tavily,
+                                search_api_key=search_api_key,
+                                search_provider=search_provider,
+                                use_web_search=use_web_search,
                                 use_claude_direct=use_claude_direct,
                                 overwrite_existing=overwrite_existing,
                                 skip_non_company_emails=skip_non_company_emails,
@@ -1060,119 +1295,196 @@ def main():
                                 input_filename=input_filename,
                                 auto_save_directory=auto_save_directory,
                                 use_concurrent=use_concurrent,
-                                max_workers=max_workers
+                                max_workers=max_workers,
+                                add_confidence_columns=add_confidence_scores
                             )
                             
-                            # Record the end time and calculate duration
                             end_time = time.time()
                             duration = end_time - start_time
                             
-                            # Display the processing time
-                            st.success(f"Processing completed in {duration:.2f} seconds!")
+                            st.success(f"✅ Processing completed in {duration:.2f} seconds!")
                         
-                        # Show results
-                        st.subheader("Results")
+                        # Store in session state
+                        st.session_state.processed_df = processed_df
+                        st.session_state.test_batch_completed = test_mode
+                        st.session_state.processing_complete = not test_mode
                         
-                        if test_mode:
-                            # Show comparison of before and after
-                            st.markdown("### Before Processing")
-                            st.dataframe(original_df.head(batch_size))
+                        # Store these for the full processing
+                        st.session_state.original_df = original_df
+                        st.session_state.batch_size = batch_size
+                        st.session_state.target_columns = target_columns
+                        st.session_state.search_contexts = search_contexts
+                        st.session_state.input_filename = input_filename
+                        st.session_state.processing_settings = {
+                            'claude_api_key': claude_api_key,
+                            'search_api_key': search_api_key,
+                            'search_provider': search_provider,
+                            'use_web_search': use_web_search,
+                            'use_claude_direct': use_claude_direct,
+                            'overwrite_existing': overwrite_existing,
+                            'skip_non_company_emails': skip_non_company_emails,
+                            'enable_auto_save': enable_auto_save,
+                            'auto_save_interval': auto_save_interval,
+                            'auto_save_directory': auto_save_directory,
+                            'use_concurrent': use_concurrent,
+                            'max_workers': max_workers,
+                            'add_confidence_scores': add_confidence_scores
+                        }
+
+            # Show results if we have processed data
+            if st.session_state.processed_df is not None:
+                st.subheader("Results")
+                
+                # Show confidence statistics if enabled
+                if st.session_state.processing_settings.get('add_confidence_scores', False):
+                    confidence_stats = calculate_confidence_statistics(st.session_state.processed_df, st.session_state.target_columns)
+                    if confidence_stats:
+                        st.subheader("📊 Confidence Statistics")
+                        stats_cols = st.columns(len(confidence_stats))
+                        for i, (col, stats) in enumerate(confidence_stats.items()):
+                            with stats_cols[i]:
+                                st.metric(f"{col}", f"{stats['mean']:.2f}", 
+                                        f"{stats['count']} values")
+                                st.caption(f"High confidence: {stats['high_confidence']}")
+                                st.caption(f"Low confidence: {stats['low_confidence']}")
+                
+                if st.session_state.test_batch_completed and not st.session_state.processing_complete:
+                    # Show comparison of before and after
+                    st.markdown("### Before Processing")
+                    st.dataframe(st.session_state.original_df.head(st.session_state.batch_size))
+                    
+                    st.markdown("### After Processing")
+                    st.dataframe(st.session_state.processed_df.head(st.session_state.batch_size))
+                    
+                    # Show changes
+                    st.markdown("### Changes Made")
+                    changes_count = 0
+                    for col in st.session_state.target_columns:
+                        if col in st.session_state.processed_df.columns and col in st.session_state.original_df.columns:
+                            col_changes = (st.session_state.processed_df.iloc[:st.session_state.batch_size][col] != st.session_state.original_df.iloc[:st.session_state.batch_size][col]).sum()
+                            changes_count += col_changes
+                            st.text(f"Changes in {col}: {col_changes} rows")
+                    
+                    st.success(f"Total changes made: {changes_count} cells")
+                    
+                    # Calculate remaining rows
+                    remaining_rows = len(st.session_state.original_df) - st.session_state.batch_size
+                    
+                    if remaining_rows > 0:
+                        # Option to process entire file
+                        st.markdown("### Process Remaining Data")
+                        st.info(f"Ready to process {remaining_rows} additional rows (from row {st.session_state.batch_size + 1} to {len(st.session_state.original_df)})")
+                        
+                        # Show preview of remaining data
+                        st.write("**Preview of remaining data:**")
+                        st.dataframe(st.session_state.original_df.iloc[st.session_state.batch_size:st.session_state.batch_size+3])
+                        
+                        # Process entire file button
+                        if st.button("Process Entire File", type="primary", key="process_entire_file"):
+                            st.subheader("Processing Complete File")
                             
-                            st.markdown("### After Processing")
-                            st.dataframe(processed_df.head(batch_size))
+                            full_progress_bar = st.progress(0)
+                            settings = st.session_state.processing_settings
                             
-                            # Show changes
-                            st.markdown("### Changes Made")
-                            changes_count = 0
-                            for col in target_columns:
-                                if col in processed_df.columns and col in original_df.columns:
-                                    col_changes = (processed_df.iloc[:batch_size][col] != original_df.iloc[:batch_size][col]).sum()
-                                    changes_count += col_changes
-                                    st.text(f"Changes in {col}: {col_changes} rows")
+                            if settings['enable_auto_save']:
+                                st.info(f"Auto-saving enabled. Files will be saved to {settings['auto_save_directory']} every {settings['auto_save_interval']} rows.")
                             
-                            st.success(f"Total changes made: {changes_count} cells")
-                            
-                            # Option to process entire file
-                            process_all = st.button("Process Entire File")
-                            if process_all:
-                                # Process entire file (excluding the already processed test batch)
-                                st.subheader("Processing Complete File")
-                                full_progress_bar = st.progress(0)
+                            with st.spinner(f"Processing remaining {remaining_rows} rows..."):
+                                start_time = time.time()
                                 
-                                # Show auto-save status if enabled
-                                if enable_auto_save:
-                                    st.info(f"Auto-saving enabled. Files will be saved to {auto_save_directory} every {auto_save_interval} rows.")
-                                
-                                with st.spinner("Processing remaining data..."):
-                                    # Record the start time
-                                    start_time = time.time()
+                                try:
+                                    final_df = process_batch(
+                                        df=st.session_state.processed_df,
+                                        start_idx=st.session_state.batch_size, 
+                                        end_idx=len(st.session_state.original_df), 
+                                        target_columns=st.session_state.target_columns,
+                                        search_contexts=st.session_state.search_contexts,
+                                        claude_api_key=settings['claude_api_key'],
+                                        search_api_key=settings['search_api_key'],
+                                        search_provider=settings['search_provider'],
+                                        use_web_search=settings['use_web_search'],
+                                        use_claude_direct=settings['use_claude_direct'],
+                                        overwrite_existing=settings['overwrite_existing'],
+                                        skip_non_company_emails=settings['skip_non_company_emails'],
+                                        progress_bar=full_progress_bar,
+                                        auto_save=settings['enable_auto_save'],
+                                        auto_save_interval=settings['auto_save_interval'],
+                                        input_filename=st.session_state.input_filename,
+                                        auto_save_directory=settings['auto_save_directory'],
+                                        use_concurrent=settings['use_concurrent'],
+                                        max_workers=settings['max_workers'],
+                                        add_confidence_columns=settings['add_confidence_scores']
+                                    )
                                     
-                                    # Process remaining rows
-                                    if batch_size < len(df):
-                                        processed_df = process_batch(
-                                            df=processed_df,
-                                            start_idx=batch_size, 
-                                            end_idx=len(df), 
-                                            target_columns=target_columns,
-                                            search_contexts=search_contexts,
-                                            claude_api_key=claude_api_key, 
-                                            tavily_api_key=tavily_api_key,
-                                            use_tavily=use_tavily,
-                                            use_claude_direct=use_claude_direct,
-                                            overwrite_existing=overwrite_existing,
-                                            skip_non_company_emails=skip_non_company_emails,
-                                            progress_bar=full_progress_bar,
-                                            auto_save=enable_auto_save,
-                                            auto_save_interval=auto_save_interval,
-                                            input_filename=input_filename,
-                                            auto_save_directory=auto_save_directory,
-                                            use_concurrent=use_concurrent,
-                                            max_workers=max_workers
-                                        )
-                                    
-                                    # Record end time and calculate duration
                                     end_time = time.time()
                                     duration = end_time - start_time
                                     
-                                    # Display processing time
-                                    st.success(f"Full processing completed in {duration:.2f} seconds!")
+                                    st.success(f"✅ Full processing completed in {duration:.2f} seconds!")
+                                    st.success(f"✅ Processed {remaining_rows} additional rows!")
                                     
-                                # Show full processed results
-                                st.success("Full file processed!")
-                                st.dataframe(processed_df)
-                                
-                                # If auto-save is enabled, show the auto-save directory
-                                if enable_auto_save:
-                                    st.success(f"Final results auto-saved to {auto_save_directory}")
-                                    # List the last few saved files
-                                    if os.path.exists(auto_save_directory):
-                                        files = [f for f in os.listdir(auto_save_directory) if f.startswith(input_filename)]
-                                        files.sort(reverse=True)  # Most recent first
-                                        if files:
-                                            st.info(f"Most recent auto-saved files:")
-                                            for i, file in enumerate(files[:5]):  # Show last 5 files
-                                                st.code(os.path.join(auto_save_directory, file))
-                                
-                                # Download options
-                                offer_download_options(processed_df)
-                        else:
-                            # If not in test mode, just show processed file and download option
-                            st.dataframe(processed_df)
-                            
-                            # If auto-save is enabled, show the auto-save directory
-                            if enable_auto_save:
-                                st.success(f"Results auto-saved to {auto_save_directory}")
-                                # List the last few saved files
-                                if os.path.exists(auto_save_directory):
-                                    files = [f for f in os.listdir(auto_save_directory) if f.startswith(input_filename)]
-                                    files.sort(reverse=True)  # Most recent first
-                                    if files:
-                                        st.info(f"Most recent auto-saved files:")
-                                        for i, file in enumerate(files[:5]):  # Show last 5 files
-                                            st.code(os.path.join(auto_save_directory, file))
-                            
-                            # Download options
-                            offer_download_options(processed_df)
+                                    # Update session state
+                                    st.session_state.processed_df = final_df
+                                    st.session_state.processing_complete = True
+                                    
+                                    # Force a rerun to show final results
+                                    st.rerun()
+                                    
+                                except Exception as e:
+                                    st.error(f"Error during full processing: {str(e)}")
+                                    if st.session_state.debug_mode:
+                                        st.error(f"Exception details: {traceback.format_exc()}")
+                    else:
+                        st.info("All rows have already been processed in the test batch!")
+                        st.session_state.processing_complete = True
+                
+                # Show final results
+                if st.session_state.processing_complete:
+                    st.markdown("### Final Results")
+                    
+                    # Show final confidence statistics
+                    if st.session_state.processing_settings.get('add_confidence_scores', False):
+                        final_confidence_stats = calculate_confidence_statistics(st.session_state.processed_df, st.session_state.target_columns)
+                        if final_confidence_stats:
+                            st.subheader("📊 Final Confidence Statistics")
+                            final_stats_cols = st.columns(len(final_confidence_stats))
+                            for i, (col, stats) in enumerate(final_confidence_stats.items()):
+                                with final_stats_cols[i]:
+                                    st.metric(f"{col}", f"{stats['mean']:.2f}", 
+                                            f"{stats['count']} values")
+                                    st.caption(f"High confidence: {stats['high_confidence']}")
+                                    st.caption(f"Low confidence: {stats['low_confidence']}")
+                    
+                    st.success("Full file processed!")
+                    st.dataframe(st.session_state.processed_df)
+                    
+                    # Show processing summary
+                    st.markdown("### Processing Summary")
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Total Rows Processed", len(st.session_state.processed_df))
+                    if hasattr(st.session_state, 'batch_size'):
+                        col2.metric("Test Batch", st.session_state.batch_size)
+                        col3.metric("Full Processing", len(st.session_state.processed_df) - st.session_state.batch_size)
+                    
+                    settings = st.session_state.processing_settings
+                    if settings['enable_auto_save']:
+                        auto_save_directory = settings['auto_save_directory']
+                        st.success(f"💾 Final results auto-saved to {auto_save_directory}")
+                        if os.path.exists(auto_save_directory):
+                            files = [f for f in os.listdir(auto_save_directory) if f.startswith(st.session_state.input_filename)]
+                            files.sort(reverse=True)
+                            if files:
+                                st.info(f"Most recent auto-saved files:")
+                                for i, file in enumerate(files[:3]):
+                                    st.code(os.path.join(auto_save_directory, file))
+                    
+                    offer_download_options(st.session_state.processed_df)
+                
+                # Reset button
+                if st.button("Start New Processing", type="secondary"):
+                    st.session_state.processed_df = None
+                    st.session_state.test_batch_completed = False
+                    st.session_state.processing_complete = False
+                    st.rerun()
                         
         except Exception as e:
             st.error(f"Error processing file: {str(e)}")
